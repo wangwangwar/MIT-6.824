@@ -30,21 +30,26 @@ func schedule(jobName string, mapFiles []string, nReduce int, phase jobPhase, re
 
 	var wg sync.WaitGroup
 	for i := 0; i < ntasks; i++ {
-		file := mapFiles[i]
-		srvName := <-registerChan
-		doTaskArgs := DoTaskArgs{
-			JobName:       jobName,
-			File:          file,
-			Phase:         phase,
-			TaskNumber:    i,
-			NumOtherPhase: n_other,
-		}
-		go func(srvName string, doTaskArgs DoTaskArgs) {
-			wg.Add(1)
-			call(srvName, "Worker.DoTask", doTaskArgs, nil)
-			wg.Done()
-			registerChan <- srvName
-		}(srvName, doTaskArgs)
+		wg.Add(1)
+		go func(i int) {
+			for {
+				file := mapFiles[i]
+				srvName := <-registerChan
+				doTaskArgs := DoTaskArgs{
+					JobName:       jobName,
+					File:          file,
+					Phase:         phase,
+					TaskNumber:    i,
+					NumOtherPhase: n_other,
+				}
+				success := call(srvName, "Worker.DoTask", doTaskArgs, nil)
+				if success {
+					wg.Done()
+					registerChan <- srvName
+					break
+				}
+			}
+		}(i)
 	}
 
 	wg.Wait()
