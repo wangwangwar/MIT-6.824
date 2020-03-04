@@ -18,6 +18,7 @@ package raft
 //
 
 import (
+	"math/rand"
 	"sync"
 	"time"
 
@@ -75,17 +76,13 @@ type Raft struct {
 
 // return currentTerm and whether this server
 // believes it is the leader.
-func (rf *Raft) GetState() (int, bool) {
-
-	var term int
-	var isleader bool
+func (rf *Raft) GetState() (term int, isLeader bool) {
 	// Your code here (2A).
 	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	term = rf.currentTerm
-	isleader = rf.role == leader
-	rf.mu.Unlock()
-
-	return term, isleader
+	isLeader = rf.role == leader
+	return
 }
 
 //
@@ -151,18 +148,34 @@ type RequestVoteReply struct {
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
+	DPrintf("Node %v receive RequestVote RPC, args %v\n", rf.me, args)
 	rf.mu.Lock()
-	defer rf.mu.Unlock()
+	rf.receivedHR = true
+	currentTerm := rf.currentTerm
+	rf.mu.Unlock()
 
-	reply.Term = rf.currentTerm
-	if args.Term < rf.currentTerm {
+	// RequestVote RPC:
+	// 1. reply false if term < currentTerm
+	// 2. If voteFor is null cor candidateId, grant vote
+	reply.Term = currentTerm
+	if args.Term < currentTerm {
 		reply.VoteGranted = false
+		DPrintf("Node %v VoteGranted = %v for candidate %v of term %v\n", rf.me, reply.VoteGranted, args.CandidateID, args.Term)
 		return
+	}
+
+	if args.Term > currentTerm {
+		rf.mu.Lock()
+		rf.currentTerm = args.Term
+		rf.role = follower
+		rf.mu.Unlock()
+		rf.votedFor = -1
 	}
 
 	if rf.votedFor == -1 || rf.votedFor == args.CandidateID {
 		reply.VoteGranted = true
 		rf.votedFor = args.CandidateID
+		DPrintf("Node %v VoteGranted = %v, votedFor = %v\n", rf.me, reply.VoteGranted, args.CandidateID)
 		return
 	}
 
@@ -201,18 +214,46 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
 
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
+	if !ok {
+		DPrintf("Node %v timeout to receive reply from server %v\n", rf.me, server)
+		return false
+	}
 
-	if reply.Term > rf.currentTerm {
+	DPrintf("Node %v receive reply from server %v, reply is %v\n", rf.me, server, reply)
+
+	rf.mu.Lock()
+	currentTerm := rf.currentTerm
+	replyTerm := reply.Term
+	rf.mu.Unlock()
+
+	if replyTerm > currentTerm {
+		rf.mu.Lock()
 		rf.currentTerm = reply.Term
 		rf.role = follower
+		rf.mu.Unlock()
+
+		DPrintf("Node %v back to follower, currentTerm: %v\n", rf.me, rf.currentTerm)
 	} else {
 		if reply.VoteGranted {
 			rf.votesReceived++
-		}
-		if rf.votesReceived > len(rf.peers)/2.0 {
-			rf.role = leader
+			if rf.role != leader && rf.votesReceived > len(rf.peers)/2.0 {
+				DPrintf("Node %v become leader\n", rf.me)
+				rf.mu.Lock()
+				rf.role = leader
+				rf.votesReceived = 0
+				rf.mu.Unlock()
+				args := AppendEntriesArgs{
+					Term:     rf.currentTerm,
+					LeaderID: rf.me,
+				}
+				var reply AppendEntriesReply
+				for i := range rf.peers {
+					if i != rf.me {
+						rf.sendAppendEntries(i, &args, &reply)
+					}
+				}
+				DPrintf("Leader %d send HR, args: %v\n", rf.me, args)
+			}
 		}
 	}
 
@@ -236,33 +277,51 @@ type AppendEntriesReply struct {
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	DPrintf("Node %d receive AppendEntries\n", rf.me)
+	rf.mu.Lock()
+	rf.receivedHR = true
+	rf.mu.Unlock()
+
+	// # AppendEntries RPC part
+	// 1. update reply.Term to currentTerm, for leader to update itself
+	// 2. reply false if term < currentTerm
 	reply.Term = rf.currentTerm
 	if args.Term < rf.currentTerm {
 		reply.Success = false
+	} else {
+		reply.Success = true
 	}
 
-	// If election timeout elapses without receiving AppendEntries RPC from current
-	// leader or granting vote to candidate: convert to candidate
-	if rf.role == follower {
-		rf.receivedHR = true
-	}
-
-	if rf.role == candidate && args.Term > rf.currentTerm {
+	// # Rules for Servers part
+	// 1. All Servers:
+	// if RPC request or response contains term T > currentTerm: set currentTerm = T, convert to follower
+	if args.Term > rf.currentTerm {
+		if rf.role == follower {
+			DPrintf("Follower %d is already follower\n", rf.me)
+		} else if rf.role == candidate {
+			DPrintf("Candidate %d become follower\n", rf.me)
+		} else if rf.role == leader {
+			DPrintf("Leader %d become follower\n", rf.me)
+		}
+		rf.mu.Lock()
+		rf.currentTerm = args.Term
 		rf.role = follower
+		rf.votedFor = -1
+		rf.mu.Unlock()
+		return
 	}
-
-	reply.Success = true
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
-
-	rf.mu.Lock()
-	if reply.Term > rf.currentTerm {
-		rf.currentTerm = reply.Term
-		rf.role = follower
+	if ok {
+		rf.mu.Lock()
+		if reply.Term > rf.currentTerm {
+			rf.currentTerm = reply.Term
+			rf.role = follower
+		}
+		rf.mu.Unlock()
 	}
-	rf.mu.Unlock()
 
 	return ok
 }
@@ -298,6 +357,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 //
 func (rf *Raft) Kill() {
 	// Your code here, if desired.
+	DPrintf("Node %v is killed", rf.me)
 }
 
 //
@@ -322,47 +382,95 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// Your initialization code here (2A, 2B, 2C).
 	go func() {
 		for {
-			time.Sleep(300)
-			// Followers
+
+			// # Rules for Servers
+			// Followers:
+			// 	If election timeout elapses without receiving AppendEntries RPC from current leader
+			//	or granting vote to candidate: convert to candidate
+			var role int
+
 			rf.mu.Lock()
-			if rf.role == follower {
-				if !rf.receivedHR {
-					rf.role = candidate
-					rf.currentTerm++
-				}
-				rf.receivedHR = false
-			}
+			role = rf.role
 			rf.mu.Unlock()
 
-			// Candidates
-			if rf.role == candidate {
+			if role == follower {
+				DPrintf("Node %v role is follower", rf.me)
+			} else if role == candidate {
+				DPrintf("Node %v role is candidate", rf.me)
+			} else {
+				DPrintf("Node %v role is leader", rf.me)
+			}
 
+			if role == follower {
+				rf.mu.Lock()
+				receivedHR := rf.receivedHR
+				if !receivedHR {
+					DPrintf("Node %v didn't receive HR, become candidate and start election\n", rf.me)
+					rf.role = candidate
+				}
+				rf.receivedHR = false
+				rf.mu.Unlock()
+			}
+
+			// # Rules for Servers
+			// Candidates:
+			//	On conversion to candidate, start election:
+			//		Increment currentTerm
+			//		Vote for self
+			//		Reset election timer
+			//		Send RequestVote RPCs to all other servers
+			rf.mu.Lock()
+			role = rf.role
+			rf.mu.Unlock()
+			if role == candidate {
+				rf.mu.Lock()
+				rf.currentTerm++
+				rf.mu.Unlock()
+				DPrintf("Candidate %v currentTerm is %v\n", rf.me, rf.currentTerm)
 				args := RequestVoteArgs{
 					Term:        rf.currentTerm,
 					CandidateID: rf.me,
 				}
 				var reply RequestVoteReply
-				for i, _ := range rf.peers {
-					if i != me {
-						rf.sendRequestVote(i, &args, &reply)
+				DPrintf("Candidate %v start election, send request votes, args: %v\n", rf.me, args)
+				for i := range rf.peers {
+					if i != rf.me {
+						go func(j int) {
+							rf.sendRequestVote(j, &args, &reply)
+						}(i)
 					}
 				}
 			}
 
 			// Leaders
-			if rf.role == leader {
+			rf.mu.Lock()
+			role = rf.role
+			rf.mu.Unlock()
+			if role == leader {
 				args := AppendEntriesArgs{
 					Term:     rf.currentTerm,
-					LeaderID: me,
+					LeaderID: rf.me,
 				}
 				var reply AppendEntriesReply
-				for i, _ := range rf.peers {
-					if i != me {
+				for i := range rf.peers {
+					if i != rf.me {
 						rf.sendAppendEntries(i, &args, &reply)
 					}
 				}
+				DPrintf("Leader %d send HR, args: %v\n", rf.me, args)
 			}
 
+			if role == leader {
+				// Leader heartbeat timeout
+				duration := (time.Duration)(rand.Float64()*50) + 100
+				DPrintf("Node %v sleep %d ms\n", rf.me, duration)
+				time.Sleep(duration * time.Millisecond)
+			} else {
+				// follower heartbeat timeout
+				duration := (time.Duration)(rand.Float64()*200) + 150
+				DPrintf("Node %v sleep %d ms\n", rf.me, duration)
+				time.Sleep(duration * time.Millisecond)
+			}
 		}
 	}()
 
